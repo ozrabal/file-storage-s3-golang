@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -115,6 +114,7 @@ func TestHandlerUploadVideo(t *testing.T) {
 			defer server.Close()
 			cfg := apiConfig{
 				db: db, jwtSecret: "test-secret", s3Bucket: "test-bucket", s3Region: "us-east-1",
+				s3CfDistribution: "https://d123example.cloudfront.net/",
 				s3Client: s3.NewFromConfig(aws.Config{
 					Region: "us-east-1", Credentials: credentials.NewStaticCredentialsProvider("test-key", "test-secret", ""),
 				}, func(o *s3.Options) {
@@ -183,7 +183,7 @@ func TestHandlerUploadVideo(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tc.wantStatus == http.StatusOK {
-				wantURL := "test-bucket," + uploadedKey
+				wantURL := "https://d123example.cloudfront.net/" + uploadedKey
 				if stored.VideoURL == nil || *stored.VideoURL != wantURL {
 					t.Fatalf("stored video URL = %v, want %s", stored.VideoURL, wantURL)
 				}
@@ -193,14 +193,8 @@ func TestHandlerUploadVideo(t *testing.T) {
 				}
 				if response.ID != video.ID || response.VideoURL == nil {
 					t.Errorf("unexpected response: %+v", response)
-				} else {
-					signedURL, err := url.Parse(*response.VideoURL)
-					if err != nil {
-						t.Fatal(err)
-					}
-					if signedURL.Scheme+"://"+signedURL.Host != server.URL || signedURL.Path != "/test-bucket/"+uploadedKey || signedURL.Query().Get("X-Amz-Signature") == "" || signedURL.Query().Get("X-Amz-Expires") != "3600" {
-						t.Errorf("unexpected signed URL: %s", signedURL)
-					}
+				} else if *response.VideoURL != wantURL {
+					t.Errorf("response video URL = %s, want %s", *response.VideoURL, wantURL)
 				}
 			} else if stored.VideoURL != nil {
 				t.Errorf("failed request updated video URL: %s", *stored.VideoURL)

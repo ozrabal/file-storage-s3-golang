@@ -102,10 +102,5 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	videoMetadata, err = cfg.dbVideoToSignedVideo(videoMetadata)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to sign video URL", err)
-		return
-	}
 	respondWithJSON(w, http.StatusOK, videoMetadata)
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/database"
@@ -114,7 +116,7 @@ func TestHandlerUploadVideo(t *testing.T) {
 			cfg := apiConfig{
 				db: db, jwtSecret: "test-secret", s3Bucket: "test-bucket", s3Region: "us-east-1",
 				s3Client: s3.NewFromConfig(aws.Config{
-					Region: "us-east-1", Credentials: aws.AnonymousCredentials{},
+					Region: "us-east-1", Credentials: credentials.NewStaticCredentialsProvider("test-key", "test-secret", ""),
 				}, func(o *s3.Options) {
 					o.BaseEndpoint = aws.String(server.URL)
 					o.UsePathStyle = true
@@ -181,7 +183,7 @@ func TestHandlerUploadVideo(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tc.wantStatus == http.StatusOK {
-				wantURL := "https://test-bucket.s3.us-east-1.amazonaws.com/" + uploadedKey
+				wantURL := "test-bucket," + uploadedKey
 				if stored.VideoURL == nil || *stored.VideoURL != wantURL {
 					t.Fatalf("stored video URL = %v, want %s", stored.VideoURL, wantURL)
 				}
@@ -189,8 +191,16 @@ func TestHandlerUploadVideo(t *testing.T) {
 				if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 					t.Fatal(err)
 				}
-				if response.ID != video.ID || response.VideoURL == nil || *response.VideoURL != wantURL {
+				if response.ID != video.ID || response.VideoURL == nil {
 					t.Errorf("unexpected response: %+v", response)
+				} else {
+					signedURL, err := url.Parse(*response.VideoURL)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if signedURL.Scheme+"://"+signedURL.Host != server.URL || signedURL.Path != "/test-bucket/"+uploadedKey || signedURL.Query().Get("X-Amz-Signature") == "" || signedURL.Query().Get("X-Amz-Expires") != "3600" {
+						t.Errorf("unexpected signed URL: %s", signedURL)
+					}
 				}
 			} else if stored.VideoURL != nil {
 				t.Errorf("failed request updated video URL: %s", *stored.VideoURL)

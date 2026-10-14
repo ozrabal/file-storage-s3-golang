@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -22,6 +23,7 @@ import (
 )
 
 func TestHandlerUploadVideo(t *testing.T) {
+	installFakeFFprobe(t)
 	for _, tc := range []struct {
 		name         string
 		mediaType    string
@@ -31,11 +33,17 @@ func TestHandlerUploadVideo(t *testing.T) {
 		invalidID    bool
 		missingVideo bool
 		s3Failure    bool
+		probeOutput  string
+		probeFailure bool
+		prefix       string
 		wantStatus   int
 		wantUpload   bool
 	}{
 		{name: "success", mediaType: "video/mp4", field: "video", wantStatus: http.StatusOK, wantUpload: true},
 		{name: "MIME parameters", mediaType: "video/mp4; codecs=avc1", field: "video", wantStatus: http.StatusOK, wantUpload: true},
+		{name: "portrait", mediaType: "video/mp4", field: "video", probeOutput: `{"streams":[{"width":1080,"height":1920}]}`, prefix: "portrait", wantStatus: http.StatusOK, wantUpload: true},
+		{name: "other", mediaType: "video/mp4", field: "video", probeOutput: `{"streams":[{"width":1000,"height":1000}]}`, prefix: "other", wantStatus: http.StatusOK, wantUpload: true},
+		{name: "probe failure", mediaType: "video/mp4", field: "video", probeFailure: true, wantStatus: http.StatusInternalServerError},
 		{name: "unsupported type", mediaType: "image/png", field: "video", wantStatus: http.StatusBadRequest},
 		{name: "invalid type", mediaType: "invalid", field: "video", wantStatus: http.StatusBadRequest},
 		{name: "missing file", mediaType: "video/mp4", field: "thumbnail", wantStatus: http.StatusBadRequest},
@@ -46,6 +54,19 @@ func TestHandlerUploadVideo(t *testing.T) {
 		{name: "S3 failure", mediaType: "video/mp4", field: "video", s3Failure: true, wantStatus: http.StatusInternalServerError, wantUpload: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			output := tc.probeOutput
+			if output == "" {
+				output = `{"streams":[{"codec_type":"video","width":1920,"height":1080}]}`
+			}
+			t.Setenv("FFPROBE_TEST_OUTPUT", output)
+			t.Setenv("FFPROBE_TEST_FAIL", "")
+			if tc.probeFailure {
+				t.Setenv("FFPROBE_TEST_FAIL", "1")
+			}
+			prefix := tc.prefix
+			if prefix == "" {
+				prefix = "landscape"
+			}
 			db, err := database.NewClient(filepath.Join(t.TempDir(), "test.db"))
 			if err != nil {
 				t.Fatal(err)
@@ -67,7 +88,7 @@ func TestHandlerUploadVideo(t *testing.T) {
 					t.Errorf("Content-Type = %q", r.Header.Get("Content-Type"))
 				}
 				uploadedKey = strings.TrimPrefix(r.URL.Path, "/test-bucket/")
-				if !regexp.MustCompile(`^[0-9a-f]{64}\.mp4$`).MatchString(uploadedKey) {
+				if !regexp.MustCompile(`^` + prefix + `/[0-9a-f]{64}\.mp4$`).MatchString(uploadedKey) {
 					t.Errorf("unexpected object path: %s", r.URL.Path)
 				}
 				body, err := io.ReadAll(r.Body)
@@ -157,6 +178,58 @@ func TestHandlerUploadVideo(t *testing.T) {
 				}
 			} else if stored.VideoURL != nil {
 				t.Errorf("failed request updated video URL: %s", *stored.VideoURL)
+			}
+		})
+	}
+}
+
+func installFakeFFprobe(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	script := `#!/bin/sh
+[ "$#" -eq 6 ] && [ "$1" = "-v" ] && [ "$2" = "error" ] && [ "$3" = "-print_format" ] && [ "$4" = "json" ] && [ "$5" = "-show_streams" ] && [ -s "$6" ] || exit 2
+[ "$FFPROBE_TEST_FAIL" != "1" ] || exit 1
+printf '%s' "$FFPROBE_TEST_OUTPUT"
+`
+	if err := os.WriteFile(filepath.Join(dir, "ffprobe"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestGetVideoAspectRatio(t *testing.T) {
+	installFakeFFprobe(t)
+	filePath := filepath.Join(t.TempDir(), "video with spaces.mp4")
+	if err := os.WriteFile(filePath, []byte("video"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		output  string
+		fail    bool
+		want    string
+		wantErr bool
+	}{
+		{name: "landscape", output: `{"streams":[{"width":1920,"height":1080}]}`, want: "16:9"},
+		{name: "portrait", output: `{"streams":[{"width":1080,"height":1920}]}`, want: "9:16"},
+		{name: "rounded landscape", output: `{"streams":[{"width":1919,"height":1080}]}`, want: "16:9"},
+		{name: "rounded portrait", output: `{"streams":[{"width":1080,"height":1919}]}`, want: "9:16"},
+		{name: "square", output: `{"streams":[{"width":1080,"height":1080}]}`, want: "other"},
+		{name: "audio first", output: `{"streams":[{"codec_type":"audio"},{"codec_type":"video","width":1920,"height":1080}]}`, want: "16:9"},
+		{name: "invalid dimensions", output: `{"streams":[{"width":1920,"height":0}]}`, wantErr: true},
+		{name: "no streams", output: `{"streams":[]}`, wantErr: true},
+		{name: "invalid JSON", output: `invalid`, wantErr: true},
+		{name: "command failure", fail: true, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("FFPROBE_TEST_OUTPUT", tc.output)
+			t.Setenv("FFPROBE_TEST_FAIL", "")
+			if tc.fail {
+				t.Setenv("FFPROBE_TEST_FAIL", "1")
+			}
+			got, err := getVideoAspectRatio(filePath)
+			if got != tc.want || (err != nil) != tc.wantErr {
+				t.Fatalf("getVideoAspectRatio() = %q, %v; want %q, error %v", got, err, tc.want, tc.wantErr)
 			}
 		})
 	}

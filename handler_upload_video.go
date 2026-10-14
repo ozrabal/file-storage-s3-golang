@@ -1,20 +1,62 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
 )
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	stdout := new(bytes.Buffer)
+	cmd.Stdout = stdout
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("probe video: %w", err)
+	}
+	var metadata struct {
+		Streams []struct {
+			CodecType string `json:"codec_type"`
+			Width     int    `json:"width"`
+			Height    int    `json:"height"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &metadata); err != nil {
+		return "", fmt.Errorf("decode video metadata: %w", err)
+	}
+	for _, stream := range metadata.Streams {
+		if stream.CodecType != "" && stream.CodecType != "video" {
+			continue
+		}
+		if stream.Width <= 0 || stream.Height <= 0 {
+			continue
+		}
+		ratio := float64(stream.Width) / float64(stream.Height)
+		const tolerance = 0.01
+		switch {
+		case math.Abs(ratio-16.0/9.0) <= tolerance:
+			return "16:9", nil
+		case math.Abs(ratio-9.0/16.0) <= tolerance:
+			return "9:16", nil
+		default:
+			return "other", nil
+		}
+	}
+	return "", errors.New("no video stream with valid dimensions")
+}
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
 	const maxUploadSize = int64(1 << 30)
@@ -96,6 +138,18 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "Failed to save temporary video file", err)
 		return
 	}
+	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to get video aspect ratio", err)
+		return
+	}
+	prefix := "other"
+	switch aspectRatio {
+	case "16:9":
+		prefix = "landscape"
+	case "9:16":
+		prefix = "portrait"
+	}
 	if _, err := tempFile.Seek(0, io.SeekStart); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to rewind temporary video file", err)
 		return
@@ -106,7 +160,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "Failed to generate video filename", err)
 		return
 	}
-	key := hex.EncodeToString(randomBytes) + ".mp4"
+	key := prefix + "/" + hex.EncodeToString(randomBytes) + ".mp4"
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(key),

@@ -24,26 +24,29 @@ import (
 
 func TestHandlerUploadVideo(t *testing.T) {
 	installFakeFFprobe(t)
+	installFakeFFmpeg(t)
 	for _, tc := range []struct {
-		name         string
-		mediaType    string
-		field        string
-		unauthorized bool
-		missingAuth  bool
-		invalidID    bool
-		missingVideo bool
-		s3Failure    bool
-		probeOutput  string
-		probeFailure bool
-		prefix       string
-		wantStatus   int
-		wantUpload   bool
+		name           string
+		mediaType      string
+		field          string
+		unauthorized   bool
+		missingAuth    bool
+		invalidID      bool
+		missingVideo   bool
+		s3Failure      bool
+		probeOutput    string
+		probeFailure   bool
+		processFailure bool
+		prefix         string
+		wantStatus     int
+		wantUpload     bool
 	}{
 		{name: "success", mediaType: "video/mp4", field: "video", wantStatus: http.StatusOK, wantUpload: true},
 		{name: "MIME parameters", mediaType: "video/mp4; codecs=avc1", field: "video", wantStatus: http.StatusOK, wantUpload: true},
 		{name: "portrait", mediaType: "video/mp4", field: "video", probeOutput: `{"streams":[{"width":1080,"height":1920}]}`, prefix: "portrait", wantStatus: http.StatusOK, wantUpload: true},
 		{name: "other", mediaType: "video/mp4", field: "video", probeOutput: `{"streams":[{"width":1000,"height":1000}]}`, prefix: "other", wantStatus: http.StatusOK, wantUpload: true},
 		{name: "probe failure", mediaType: "video/mp4", field: "video", probeFailure: true, wantStatus: http.StatusInternalServerError},
+		{name: "processing failure", mediaType: "video/mp4", field: "video", processFailure: true, wantStatus: http.StatusInternalServerError},
 		{name: "unsupported type", mediaType: "image/png", field: "video", wantStatus: http.StatusBadRequest},
 		{name: "invalid type", mediaType: "invalid", field: "video", wantStatus: http.StatusBadRequest},
 		{name: "missing file", mediaType: "video/mp4", field: "thumbnail", wantStatus: http.StatusBadRequest},
@@ -54,6 +57,12 @@ func TestHandlerUploadVideo(t *testing.T) {
 		{name: "S3 failure", mediaType: "video/mp4", field: "video", s3Failure: true, wantStatus: http.StatusInternalServerError, wantUpload: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			uploadDir := t.TempDir()
+			t.Setenv("TMPDIR", uploadDir)
+			t.Setenv("FFMPEG_TEST_FAIL", "")
+			if tc.processFailure {
+				t.Setenv("FFMPEG_TEST_FAIL", "1")
+			}
 			output := tc.probeOutput
 			if output == "" {
 				output = `{"streams":[{"codec_type":"video","width":1920,"height":1080}]}`
@@ -92,7 +101,7 @@ func TestHandlerUploadVideo(t *testing.T) {
 					t.Errorf("unexpected object path: %s", r.URL.Path)
 				}
 				body, err := io.ReadAll(r.Body)
-				if err != nil || !bytes.Equal(body, payload) {
+				if err != nil || !bytes.Equal(body, append([]byte("processed: "), payload...)) {
 					t.Errorf("uploaded body = %q, error = %v", body, err)
 				}
 				if tc.s3Failure {
@@ -150,6 +159,13 @@ func TestHandlerUploadVideo(t *testing.T) {
 			}
 			recorder := httptest.NewRecorder()
 			cfg.handlerUploadVideo(recorder, request)
+			remaining, err := os.ReadDir(uploadDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(remaining) != 0 {
+				t.Errorf("temporary upload files were not removed: %v", remaining)
+			}
 			if recorder.Code != tc.wantStatus {
 				t.Fatalf("status = %d, want %d: %s", recorder.Code, tc.wantStatus, recorder.Body.String())
 			}
@@ -181,6 +197,21 @@ func TestHandlerUploadVideo(t *testing.T) {
 			}
 		})
 	}
+}
+
+func installFakeFFmpeg(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	script := `#!/bin/sh
+[ "$#" -eq 9 ] && [ "$1" = "-i" ] && [ -s "$2" ] && [ "$3" = "-c" ] && [ "$4" = "copy" ] && [ "$5" = "-movflags" ] && [ "$6" = "faststart" ] && [ "$7" = "-f" ] && [ "$8" = "mp4" ] && [ "$9" = "$2.processing" ] || exit 2
+printf 'processed: ' > "$9"
+[ "$FFMPEG_TEST_FAIL" != "1" ] || exit 1
+cat "$2" >> "$9"
+`
+	if err := os.WriteFile(filepath.Join(dir, "ffmpeg"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 func installFakeFFprobe(t *testing.T) {
